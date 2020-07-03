@@ -25,6 +25,12 @@ export interface InjectorOptions {
   children?: Injector[];
 }
 
+const unresolved = Symbol('unresolved');
+
+function isUnresolved(value: unknown): value is typeof unresolved {
+  return value === unresolved;
+}
+
 export class Injector<Session extends object = any> {
   private _classMap = new Map<ServiceIdentifier<any>, Type<any>>();
   private _factoryMap = new Map<ServiceIdentifier<any>, Factory<any>>();
@@ -186,45 +192,68 @@ export class Injector<Session extends object = any> {
         return this._sessionScopeServiceIdentifiers;
     }
   }
+
   public get<T>(serviceIdentifier: ServiceIdentifier<T>, dependencyIndex?: number): T {
+    const result = this.resolve(serviceIdentifier);
+
+    if (isUnresolved(result)) {
+      throw new ServiceIdentifierNotFoundError(serviceIdentifier, this._name, dependencyIndex);
+    }
+
+    return result;
+  }
+
+  private resolve<T>(serviceIdentifier: ServiceIdentifier<T>): T | typeof unresolved {
     const applicationScopeInstanceMap = this.getScopeInstanceMap(ProviderScope.Application);
     const sessionScopeInstanceMap = this.getScopeInstanceMap(ProviderScope.Session);
+
     if (sessionScopeInstanceMap.has(serviceIdentifier)) {
       return sessionScopeInstanceMap.get(serviceIdentifier);
     } else if (applicationScopeInstanceMap.has(serviceIdentifier)) {
       return applicationScopeInstanceMap.get(serviceIdentifier);
     } else if (this._classMap.has(serviceIdentifier)) {
       const RealClazz = this._classMap.get(serviceIdentifier);
-      try {
-        const dependencies: Array<ServiceIdentifier<any>> = Reflect.getMetadata(DESIGN_PARAMTYPES, RealClazz) || [];
-        const dependencyInstances = dependencies.map((dependency, dependencyIndex) =>
-          this.get(dependency, dependencyIndex)
-        );
-        const instance = new RealClazz(...dependencyInstances);
-        const propertyKeys = Reflect.getMetadata(PROPERTY_KEYS, RealClazz) || [];
-        for (const propertyKey of propertyKeys) {
-          const dependency = Reflect.getMetadata(DESIGN_TYPE, RealClazz.prototype, propertyKey);
-          if (dependency) {
-            Object.defineProperty(instance, propertyKey, {
-              value: this.get(dependency, propertyKeys.indexOf(propertyKey)),
-            });
+
+      const dependencies: Array<ServiceIdentifier<any>> = Reflect.getMetadata(DESIGN_PARAMTYPES, RealClazz) || [];
+      const dependencyInstances = dependencies.map((dependency, dependencyIndex) => {
+        const resolvedDependency = this.resolve(dependency);
+
+        if (isUnresolved(resolvedDependency)) {
+          throw new DependencyProviderNotFoundError(dependency, RealClazz, this._name, dependencyIndex);
+        }
+
+        return resolvedDependency;
+      });
+
+      const instance = new RealClazz(...dependencyInstances);
+      const propertyKeys = Reflect.getMetadata(PROPERTY_KEYS, RealClazz) || [];
+      for (let i = 0; i < propertyKeys.length; i++) {
+        const propertyKey = propertyKeys[i];
+        const dependency = Reflect.getMetadata(DESIGN_TYPE, RealClazz.prototype, propertyKey);
+
+        if (dependency) {
+          const resolvedDependency = this.resolve(dependency);
+
+          if (isUnresolved(resolvedDependency)) {
+            throw new DependencyProviderNotFoundError(dependency, RealClazz, this._name, i);
           }
-        }
-        if (this._applicationScopeServiceIdentifiers.includes(serviceIdentifier)) {
-          this._applicationScopeInstanceMap.set(serviceIdentifier, instance);
-        }
-        if (this._sessionScopeServiceIdentifiers.includes(serviceIdentifier)) {
-          this._sessionScopeInstanceMap.set(serviceIdentifier, instance);
-        }
-        this.onInstanceCreated({ serviceIdentifier, instance });
-        return instance;
-      } catch (e) {
-        if (e instanceof ServiceIdentifierNotFoundError) {
-          throw new DependencyProviderNotFoundError(e.serviceIdentifier, RealClazz, this._name, e.dependencyIndex);
-        } else {
-          throw e;
+
+          Object.defineProperty(instance, propertyKey, {
+            value: resolvedDependency,
+          });
         }
       }
+
+      if (this._applicationScopeServiceIdentifiers.includes(serviceIdentifier)) {
+        this._applicationScopeInstanceMap.set(serviceIdentifier, instance);
+      }
+
+      if (this._sessionScopeServiceIdentifiers.includes(serviceIdentifier)) {
+        this._sessionScopeInstanceMap.set(serviceIdentifier, instance);
+      }
+
+      this.onInstanceCreated({ serviceIdentifier, instance });
+      return instance;
     } else if (this._factoryMap.has(serviceIdentifier)) {
       const factory = this._factoryMap.get(serviceIdentifier);
       const instance = this.call(factory, this);
@@ -238,20 +267,19 @@ export class Injector<Session extends object = any> {
       return instance;
     } else {
       for (const child of this._children) {
-        try {
-          const instance = child.get(serviceIdentifier);
-          return instance;
-        } catch (e) {
-          if (e instanceof ServiceIdentifierNotFoundError && e.serviceIdentifier === serviceIdentifier) {
-            continue;
-          } else {
-            throw e;
-          }
+        const instance = child.resolve(serviceIdentifier);
+
+        if (!instance) {
+          continue;
         }
+
+        return instance;
       }
-      throw new ServiceIdentifierNotFoundError(serviceIdentifier, this._name, dependencyIndex);
+
+      return unresolved;
     }
   }
+
   private _sessionSessionInjectorMap = new WeakMap<Session, Injector>();
   public hasSessionInjector(session: Session) {
     return this._sessionSessionInjectorMap.has(session);
